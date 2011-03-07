@@ -1049,12 +1049,36 @@ WebSocketParser.prototype.execute = function (incoming_buf) {
     }
 };
 
-function TCP_tracker() {
+function TCP_tracker(args) {
+    args = args || {};
     this.sessions = {};
     events.EventEmitter.call(this);
+    this.num_sessions = 0;
+    this.last_cleanup_time = 0;
+    // time (in ms) in which sessions expire with no activity
+    this.session_expire_time = args.session_expire_time || 600000;
+    // time (in ms) between cleanups
+    this.session_cleanup_time = args.session_cleanup_time || 600000;
 }
 util.inherits(TCP_tracker, events.EventEmitter);
 exports.TCP_tracker = TCP_tracker;
+
+TCP_tracker.prototype.cleanup_sessions = function(cur_time){
+    //console.log("running cleanup...");
+    var self = this,
+        num_cleaned = 0;
+
+    this.last_cleanup_time = cur_time;
+    //*
+    for(var key in self.sessions){
+        if(cur_time - self.sessions[key].current_cap_time > self.session_expire_time){
+            num_cleaned++;
+            this.num_sessions--;
+            delete self.sessions[key];
+        }
+    }
+    //console.log('cleaned up: ' + num_cleaned);
+}
 
 TCP_tracker.prototype.make_session_key = function (src, dst) {
     return [ src, dst ].sort().join("-");
@@ -1276,6 +1300,7 @@ TCP_tracker.prototype.track_states.SYN_SENT = function (packet, session) {
         session.state = "SYN_RCVD";
     } else if (tcp.flags.rst) {
         session.state = "CLOSED";
+        this.num_sessions--;
         delete this.sessions[session.key];
         this.emit('reset', session, "recv"); // TODO - check which direction did the reset, probably recv
     } else {
@@ -1426,6 +1451,7 @@ TCP_tracker.prototype.track_states.LAST_ACK = function (packet, session) {
     if (src === session.dst) {
         session.close_time = packet.pcap_header.time_ms;
         session.state = "CLOSED";
+        this.num_sessions--;
         delete this.sessions[session.key];
         this.emit('end', session);
     }
@@ -1440,6 +1466,7 @@ TCP_tracker.prototype.track_states.CLOSING = function (packet, session) {
     if (src === session.src) {
         session.close_time = packet.pcap_header.time_ms;
         session.state = "CLOSED";
+        this.num_sessions--;
         delete this.sessions[session.key];
         this.emit('end', session);
     }
@@ -1462,6 +1489,9 @@ TCP_tracker.prototype.track_next = function (key, packet) {
     }
 
     if (typeof this.track_states[session.state] === 'function') {
+        if(packet.pcap_header.time_ms > this.last_cleanup_time + this.session_cleanup_time){
+            this.cleanup_sessions(packet.pcap_header.time_ms);
+        }
         this.track_states[session.state].call(this, packet, session);
     } else {
         console.log(util.debug(session));
@@ -1471,6 +1501,8 @@ TCP_tracker.prototype.track_next = function (key, packet) {
 
 TCP_tracker.prototype.track_packet = function (packet) {
     var ip, tcp, src, dst, key, session, self = this;
+    self.packets_since_cleanup++;
+    if(self.last_cleanup_time == 0) self.last_cleanup_time = packet.pcap_header.time_ms;
 
     if (packet.link && packet.link.ip && packet.link.ip.tcp) {
         ip  = packet.link.ip;
@@ -1482,6 +1514,7 @@ TCP_tracker.prototype.track_packet = function (packet) {
 
         if (tcp.flags.syn && !tcp.flags.ack) {
             if (session === undefined) {
+                this.num_sessions++;
                 this.sessions[key] = {
                     src: src, // the side the sent the initial SYN
                     dst: dst, // the side that the initial SYN was sent to
